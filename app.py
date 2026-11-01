@@ -5,12 +5,12 @@ import yfinance as yf
 
 # 網頁基本設定
 st.set_page_config(
-    page_title="高波動低 RSI 策略回測系統", page_icon="📈", layout="wide"
+    page_title="雙重條件篩選策略回測系統", page_icon="📈", layout="wide"
 )
 
-st.title("📊 動態資產配置回測系統：高波動 + 低 RSI 策略")
+st.title("📊 動態資產配置回測系統：高波動門檻 + 低 RSI 策略")
 st.markdown("""
-這個工具讓你可以自訂資產池，並在每個調倉日篩選出**波動度較高**且 **RSI 低於指定水準**（超賣現象）的標的進行等權重配置，並回測其歷史績效。
+這個工具讓你可以自訂資產池，並在每個調倉日篩選出**年化波動度高於指定水準**且 **RSI 低於超賣閾值**的標的進行等權重配置；若無任何標的符合條件則當期空手。
 """)
 
 
@@ -49,8 +49,8 @@ rsi_threshold = st.sidebar.slider(
 vol_lookback = st.sidebar.slider(
     "波動度計算天數 (Lookback)", 10, 120, 60
 )
-top_n_vol = st.sidebar.slider(
-    "挑選高波動資產數量 (Top N)", 1, len(tickers), min(5, len(tickers))
+min_vol_threshold = (
+    st.sidebar.slider("最低年化波動度門檻 (%)", 10.0, 100.0, 30.0, 5.0) / 100.0
 )
 
 rebalance_freq = st.sidebar.selectbox(
@@ -60,8 +60,8 @@ rebalance_freq = st.sidebar.selectbox(
 run_button = st.sidebar.button("🚀 開始回測", type="primary")
 
 if run_button:
-  if len(tickers) < top_n_vol:
-    st.error("錯誤：資產池的數量不能小於挑選的高波動資產數量！")
+  if len(tickers) == 0:
+    st.error("錯誤：請至少輸入一個資產代號！")
   else:
     with st.spinner("正在下載歷史資料並進行回測運算中..."):
       # 1. 下載資料
@@ -94,7 +94,7 @@ if run_button:
 
       portfolio_returns = []
       holdings_history = []
-      all_period_details = []  # 收集每個調倉日所有標的的詳細數據
+      all_period_details = []
 
       # 4. 回測主迴圈
       for i in range(len(rebal_dates) - 1):
@@ -110,40 +110,54 @@ if run_button:
         current_vol = volatility.loc[start_rd]
         current_rsi = rsi_df.loc[start_rd]
 
-        # 條件篩選
-        qualified = current_rsi[current_rsi < rsi_threshold].index
-        if len(qualified) > 0:
-          selected = (
-              current_vol[qualified]
-              .nlargest(min(top_n_vol, len(qualified)))
-              .index.tolist()
-          )
-        else:
-          selected = current_vol.nlargest(top_n_vol).index.tolist()
+        # 雙重條件篩選：年化波動度 >= 門檻 且 RSI < 閾值
+        qualified = current_vol[
+            (current_vol >= min_vol_threshold) & (current_rsi < rsi_threshold)
+        ].index.tolist()
 
-        holdings_history.append(
-            {"Date": start_rd.strftime("%Y-%m-%d"), "Selected Stocks": selected}
+        selected = (
+            qualified  # 符合條件的全數納入，若無則為空串列（代表空手）
         )
 
-        # 記錄當期所有標的的波動度與 RSI 狀況（需求 2）
+        holdings_history.append({
+            "Date": start_rd.strftime("%Y-%m-%d"),
+            "Selected Stocks": selected if selected else ["【無符合標的：空手】"],
+        })
+
+        # 記錄當期所有標的的檢視狀態
         for ticker in data.columns:
           v = current_vol[ticker]
           r = current_rsi[ticker]
-          is_qualified = r < rsi_threshold if not pd.isna(r) else False
+          is_vol_ok = v >= min_vol_threshold if not pd.isna(v) else False
+          is_rsi_ok = r < rsi_threshold if not pd.isna(r) else False
           is_selected = ticker in selected
           all_period_details.append({
               "調倉日期": start_rd.strftime("%Y-%m-%d"),
               "代號": ticker,
               "年化波動度": round(v, 4) if not pd.isna(v) else 0,
               "RSI 值": round(r, 2) if not pd.isna(r) else 0,
-              "符合 RSI 超賣": "✅ 是" if is_qualified else "❌ 否",
+              f"符合波動門檻 (>= {min_vol_threshold*100:.0f}%)": (
+                  "✅ 是" if is_vol_ok else "❌ 否"
+              ),
+              "符合 RSI 超賣": "✅ 是" if is_rsi_ok else "❌ 否",
               "是否入選配置": "⭐ 入選" if is_selected else "-",
           })
 
-        # 計算報酬率
-        period_data = daily_returns.loc[start_rd:end_rd, selected].iloc[1:]
-        if not period_data.empty:
-          period_portfolio_return = period_data.mean(axis=1)
+        # 計算報酬率（若有選中則等權重配置，若無選中則該期報酬為 0/空手）
+        period_days_idx = daily_returns.loc[start_rd:end_rd].index[1:]
+        if len(selected) > 0:
+          period_data = daily_returns.loc[start_rd:end_rd, selected].iloc[
+              1:
+          ]
+          if not period_data.empty:
+            period_portfolio_return = period_data.mean(axis=1)
+          else:
+            period_portfolio_return = pd.Series(0.0, index=period_days_idx)
+        else:
+          # 當期空手，報酬率為 0
+          period_portfolio_return = pd.Series(0.0, index=period_days_idx)
+
+        if not period_portfolio_return.empty:
           portfolio_returns.append(period_portfolio_return)
 
       if portfolio_returns:
@@ -174,7 +188,7 @@ if run_button:
         drawdown_strat = (strategy_cum - rolling_max_strat) / rolling_max_strat
         max_drawdown_strat = drawdown_strat.min()
 
-        # 基準 (Benchmark) 績效指標（需求 3）
+        # 基準績效指標
         total_return_bench = benchmark_cum.iloc[-1] - 1
         annual_return_bench = (
             1 + total_return_bench
@@ -197,12 +211,12 @@ if run_button:
         st.markdown("---")
         st.info(f"""
         📌 **【策略選股模式說明】**
-        * **買入核心邏輯**：在每個調倉日，系統會先掃描資產池，挑選出 **RSI 低於 {rsi_threshold}**（進入超賣區）的標的。
-        * **高波動篩選**：若符合超賣條件的標的數量大於或等於設定數量，系統會進一步從中挑選 **過去 {vol_lookback} 天年化波動度最高的前 {top_n_vol} 檔** 進行等權重配置；若無標的符合 RSI 條件，則退而求其次直接選取波動度最高的前 {top_n_vol} 檔。
+        * **進場雙重條件**：在每個調倉日，資產必須同時滿足 **年化波動度 $\\ge$ {min_vol_threshold*100:.0f}%** 且 **RSI < {rsi_threshold}**。
+        * **配置方式**：符合條件的所有標的進行**等權重配置**；若當期**沒有任何標的同時符合**上述兩個條件，則該期**選擇空手（持有現金，報酬率為 0）**，絕不勉強湊數。
         * **調倉頻率**：{rebalance_freq}。
         """)
 
-        # 3. 核心績效數據指標呈現（策略 vs 基準）
+        # 3. 核心績效數據指標呈現
         st.subheader("📊 核心績效數據總覽")
         col1, col2, col3, col4 = st.columns(4)
         col1.metric(
@@ -230,13 +244,13 @@ if run_button:
         st.subheader("📈 策略 vs 基準 累積績效走勢")
         chart_data = pd.DataFrame(
             {
-                "高波動低 RSI 策略": strategy_cum,
+                "雙重條件策略 (含空手機制)": strategy_cum,
                 "資產池等權重平均 (Benchmark)": benchmark_cum,
             }
         )
         st.line_chart(chart_data)
 
-        # 4. 回撤 (Drawdown) 圖表與表格呈現
+        # 4. 回撤圖表與表格
         st.subheader("📉 回撤 (Drawdown) 走勢分析")
         drawdown_chart_data = pd.DataFrame(
             {
@@ -246,7 +260,6 @@ if run_button:
         )
         st.line_chart(drawdown_chart_data)
 
-        # 回撤數值摘要表
         dd_summary_df = pd.DataFrame({
             "指標": ["最大回撤 (Maximum Drawdown)", "平均回撤"],
             "策略": [
@@ -260,12 +273,12 @@ if run_button:
         })
         st.dataframe(dd_summary_df, use_container_width=True)
 
-        # 2. 說明 Tag / 展開區塊：每個月分每個標的的波動度、RSI 及入選狀態
-        st.subheader("📋 每期調倉標的詳細明細（含各資產波動度與 RSI）")
+        # 2. 每期詳細明細
+        st.subheader("📋 每期調倉標的詳細明細（含雙重檢核狀態）")
         details_df = pd.DataFrame(all_period_details)
         st.dataframe(details_df, use_container_width=True)
 
       else:
         st.warning(
-            "在選定的條件下沒有產生足夠的交易訊號，請嘗試放寬 RSI 閾值或增加資產池。"
+            "在選定的條件下沒有產生足夠的交易訊號，請嘗試調整波動度門檻或 RSI 閾值。"
         )
