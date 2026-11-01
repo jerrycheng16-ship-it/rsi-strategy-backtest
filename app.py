@@ -26,7 +26,7 @@ def compute_rsi(series, period=14):
 # 側邊欄：參數設定
 st.sidebar.header("⚙️ 回測參數設定")
 
-# 預設資產池（美股科技與熱門股，台股可加上 .TW，例如 2330.TW）
+# 預設資產池
 default_tickers = (
     "AAPL, MSFT, GOOGL, AMZN, TSLA, NVDA, META, AMD, NFLX, QQQ, SPY"
 )
@@ -72,7 +72,6 @@ if run_button:
       if isinstance(data, pd.Series):
         data = data.to_frame()
 
-      # 移除含有過多空值的欄位
       data = data.dropna(axis=1, how="all")
 
       # 2. 計算每日報酬率、波動度與 RSI
@@ -91,20 +90,18 @@ if run_button:
       else:
         rebal_dates = data.resample("W").last().index
 
-      # 過濾在開始日期之後的調倉日
       rebal_dates = [d for d in rebal_dates if d >= data.index[vol_lookback]]
 
       portfolio_returns = []
       holdings_history = []
+      all_period_details = []  # 收集每個調倉日所有標的的詳細數據
 
       # 4. 回測主迴圈
       for i in range(len(rebal_dates) - 1):
         start_rd = rebal_dates[i]
         end_rd = rebal_dates[i + 1]
 
-        # 取得調倉當日的波動度與 RSI
         if start_rd not in volatility.index:
-          # 找最近的有效交易日
           valid_idx = volatility.index.get_indexer(
               [start_rd], method="nearest"
           )[0]
@@ -113,33 +110,40 @@ if run_button:
         current_vol = volatility.loc[start_rd]
         current_rsi = rsi_df.loc[start_rd]
 
-        # 條件篩選：
-        # 1. RSI低於指定水準
-        # 2. 符合條件中，挑選波動度最高的 Top N
+        # 條件篩選
         qualified = current_rsi[current_rsi < rsi_threshold].index
         if len(qualified) > 0:
-          # 從符合 RSI 條件的裡面挑選波動度最高的前 N 個
           selected = (
               current_vol[qualified]
               .nlargest(min(top_n_vol, len(qualified)))
               .index.tolist()
           )
         else:
-          # 如果沒有任何股票符合 RSI 條件，則退而求其次直接選波動度最高的前 N 個（或空手，此處示範選波動高者）
           selected = current_vol.nlargest(top_n_vol).index.tolist()
 
         holdings_history.append(
             {"Date": start_rd.strftime("%Y-%m-%d"), "Selected Stocks": selected}
         )
 
-        # 計算這段持有期間內的每日報酬率（等權重配置）
-        period_data = daily_returns.loc[start_rd:end_rd, selected].iloc[
-            1:
-        ]  # 排除調倉當日重複計算
+        # 記錄當期所有標的的波動度與 RSI 狀況（需求 2）
+        for ticker in data.columns:
+          v = current_vol[ticker]
+          r = current_rsi[ticker]
+          is_qualified = r < rsi_threshold if not pd.isna(r) else False
+          is_selected = ticker in selected
+          all_period_details.append({
+              "調倉日期": start_rd.strftime("%Y-%m-%d"),
+              "代號": ticker,
+              "年化波動度": round(v, 4) if not pd.isna(v) else 0,
+              "RSI 值": round(r, 2) if not pd.isna(r) else 0,
+              "符合 RSI 超賣": "✅ 是" if is_qualified else "❌ 否",
+              "是否入選配置": "⭐ 入選" if is_selected else "-",
+          })
+
+        # 計算報酬率
+        period_data = daily_returns.loc[start_rd:end_rd, selected].iloc[1:]
         if not period_data.empty:
-          period_portfolio_return = period_data.mean(
-              axis=1
-          )  # 等權重平均報酬
+          period_portfolio_return = period_data.mean(axis=1)
           portfolio_returns.append(period_portfolio_return)
 
       if portfolio_returns:
@@ -148,17 +152,14 @@ if run_button:
             ~strategy_rets.index.duplicated(keep="first"
         )]
 
-        # 計算基準（大盤，如 SPY 或資產池平均）作對比
         benchmark_rets = daily_returns.mean(axis=1).loc[strategy_rets.index]
 
         # 累積報酬率
         strategy_cum = (1 + strategy_rets).cumprod()
         benchmark_cum = (1 + benchmark_rets).cumprod()
 
-        # 績效指標計算
+        # 策略績效指標
         total_return_strat = strategy_cum.iloc[-1] - 1
-        total_return_bench = benchmark_cum.iloc[-1] - 1
-
         annual_return_strat = (
             1 + total_return_strat
         ) ** (252 / len(strategy_rets)) - 1
@@ -169,28 +170,64 @@ if run_button:
             else 0
         )
 
-        # 最大回撤 (MDD)
-        rolling_max = strategy_cum.cummax()
-        drawdown = (strategy_cum - rolling_max) / rolling_max
-        max_drawdown = drawdown.min()
+        rolling_max_strat = strategy_cum.cummax()
+        drawdown_strat = (strategy_cum - rolling_max_strat) / rolling_max_strat
+        max_drawdown_strat = drawdown_strat.min()
+
+        # 基準 (Benchmark) 績效指標（需求 3）
+        total_return_bench = benchmark_cum.iloc[-1] - 1
+        annual_return_bench = (
+            1 + total_return_bench
+        ) ** (252 / len(benchmark_rets)) - 1
+        annual_vol_bench = benchmark_rets.std() * np.sqrt(252)
+        sharpe_ratio_bench = (
+            annual_return_bench / annual_vol_bench
+            if annual_vol_bench != 0
+            else 0
+        )
+
+        rolling_max_bench = benchmark_cum.cummax()
+        drawdown_bench = (benchmark_cum - rolling_max_bench) / rolling_max_bench
+        max_drawdown_bench = drawdown_bench.min()
 
         # --- 呈現結果 ---
         st.success("回測完成！")
 
+        # 1. 說明 Tag：策略選股模式解釋
+        st.markdown("---")
+        st.info(f"""
+        📌 **【策略選股模式說明】**
+        * **買入核心邏輯**：在每個調倉日，系統會先掃描資產池，挑選出 **RSI 低於 {rsi_threshold}**（進入超賣區）的標的。
+        * **高波動篩選**：若符合超賣條件的標的數量大於或等於設定數量，系統會進一步從中挑選 **過去 {vol_lookback} 天年化波動度最高的前 {top_n_vol} 檔** 進行等權重配置；若無標的符合 RSI 條件，則退而求其次直接選取波動度最高的前 {top_n_vol} 檔。
+        * **調倉頻率**：{rebalance_freq}。
+        """)
+
+        # 3. 核心績效數據指標呈現（策略 vs 基準）
+        st.subheader("📊 核心績效數據總覽")
         col1, col2, col3, col4 = st.columns(4)
         col1.metric(
-            "策略總報酬率",
-            f"{total_return_strat*100:.2f}%",
-            f"年化: {annual_return_strat*100:.2f}%",
+            "策略年化報酬率",
+            f"{annual_return_strat*100:.2f}%",
+            f"總報酬: {total_return_strat*100:.2f}%",
         )
-        col2.metric("策略夏普值 (Sharpe)", f"{sharpe_ratio:.2f}")
-        col3.metric("策略最大回撤 (MDD)", f"{max_drawdown*100:.2f}%")
+        col2.metric(
+            "基準 (Benchmark) 年化報酬率",
+            f"{annual_return_bench*100:.2f}%",
+            f"總報酬: {total_return_bench*100:.2f}%",
+        )
+        col3.metric(
+            "策略最大回撤 (MDD)",
+            f"{max_drawdown_strat*100:.2f}%",
+            f"夏普值: {sharpe_ratio:.2f}",
+        )
         col4.metric(
-            "基準總報酬率 (均值)", f"{total_return_bench*100:.2f}%"
+            "基準最大回撤 (MDD)",
+            f"{max_drawdown_bench*100:.2f}%",
+            f"夏普值: {sharpe_ratio_bench:.2f}",
         )
 
         # 繪製績效曲線圖
-        st.subheader("📈 策略 vs 資產池平均 累積績效走勢")
+        st.subheader("📈 策略 vs 基準 累積績效走勢")
         chart_data = pd.DataFrame(
             {
                 "高波動低 RSI 策略": strategy_cum,
@@ -199,10 +236,34 @@ if run_button:
         )
         st.line_chart(chart_data)
 
-        # 顯示最近一次調倉明細
-        st.subheader("📋 近期調倉標的紀錄")
-        history_df = pd.DataFrame(holdings_history)
-        st.dataframe(history_df, use_container_width=True)
+        # 4. 回撤 (Drawdown) 圖表與表格呈現
+        st.subheader("📉 回撤 (Drawdown) 走勢分析")
+        drawdown_chart_data = pd.DataFrame(
+            {
+                "策略回撤 (%)": drawdown_strat * 100,
+                "基準回撤 (%)": drawdown_bench * 100,
+            }
+        )
+        st.line_chart(drawdown_chart_data)
+
+        # 回撤數值摘要表
+        dd_summary_df = pd.DataFrame({
+            "指標": ["最大回撤 (Maximum Drawdown)", "平均回撤"],
+            "策略": [
+                f"{max_drawdown_strat*100:.2f}%",
+                f"{drawdown_strat.mean()*100:.2f}%",
+            ],
+            "基準 (Benchmark)": [
+                f"{max_drawdown_bench*100:.2f}%",
+                f"{drawdown_bench.mean()*100:.2f}%",
+            ],
+        })
+        st.dataframe(dd_summary_df, use_container_width=True)
+
+        # 2. 說明 Tag / 展開區塊：每個月分每個標的的波動度、RSI 及入選狀態
+        st.subheader("📋 每期調倉標的詳細明細（含各資產波動度與 RSI）")
+        details_df = pd.DataFrame(all_period_details)
+        st.dataframe(details_df, use_container_width=True)
 
       else:
         st.warning(
